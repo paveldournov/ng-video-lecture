@@ -1,0 +1,7 @@
+# trained weights (~50 MB each) and training logs
+*.pt
+*.log
+# editor settings and Word temp files
+.vscode/
+~WRD*.tmp
+__pycache__/

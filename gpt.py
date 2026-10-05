@@ -1,12 +1,15 @@
 import os
+import time
 import torch
+import math
 import torch.nn as nn
 from torch.nn import functional as F
+from tokenizers import Tokenizer
 
 # hyperparameters
 batch_size = 64 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
-max_iters = 1000
+max_iters = 2000
 eval_interval = 100
 learning_rate = 3e-4
 if not torch.cuda.is_available():
@@ -20,26 +23,31 @@ n_embd = 384
 n_head = 6
 n_layer = 6
 dropout = 0.2
-checkpoint_path = 'gpt-eng.model.pt' # trained weights are saved here; delete the file to retrain
+input_path = 'warandpeace.txt' # UTF-8 training text; was 'input.txt' (tiny shakespeare)
+tokenizer_path = 'tokenizer-rus.json' # BPE tokenizer trained on input_path by train_tokenizer.py
+checkpoint_path = 'gpt-rus-bpe.model.pt' # best weights (lowest val loss) are saved here; delete the file to retrain
 # ------------
 
 torch.manual_seed(1337)
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-with open('input.txt', 'r', encoding='utf-8') as f:
+with open(input_path, 'r', encoding='utf-8') as f:
     text = f.read()
 
-# here are all the unique characters that occur in this text
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
-# create a mapping from characters to integers
-stoi = { ch:i for i,ch in enumerate(chars) }
-itos = { i:ch for i,ch in enumerate(chars) }
-encode = lambda s: [stoi[c] for c in s] # encoder: take a string, output a list of integers
-decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
+# subword tokens instead of characters: run train_tokenizer.py first to create the tokenizer
+if not os.path.exists(tokenizer_path):
+    raise SystemExit(f"tokenizer {tokenizer_path} not found; run: python train_tokenizer.py --input {input_path} --output {tokenizer_path}")
+tokenizer = Tokenizer.from_file(tokenizer_path)
+vocab_size = tokenizer.get_vocab_size()
+encode = lambda s: tokenizer.encode(s).ids # encoder: take a string, output a list of integers
+decode = lambda l: tokenizer.decode(l) # decoder: take a list of integers, output a string
 
 # Train and test splits
 data = torch.tensor(encode(text), dtype=torch.long)
+# per-token losses aren't comparable across tokenizers, so also report bits per character
+chars_per_token = len(text) / len(data)
+bits_per_char = lambda loss: loss / chars_per_token / math.log(2)
+print(f"{len(text):,} characters -> {len(data):,} tokens, vocab size {vocab_size}")
 n = int(0.9*len(data)) # first 90% will be train, rest val
 train_data = data[:n]
 val_data = data[n:]
@@ -207,20 +215,41 @@ m = model.to(device)
 # print the number of parameters in the model
 print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
+def save_checkpoint(iter, val_loss):
+    # everything infer.py needs to rebuild the model without this script or the training text
+    torch.save({
+        'model': model.state_dict(),
+        'config': dict(vocab_size=vocab_size, block_size=block_size, n_embd=n_embd, n_head=n_head, n_layer=n_layer),
+        'tokenizer': tokenizer_path,
+        'iter': iter,
+        'val_loss': val_loss,
+    }, checkpoint_path)
+
 if os.path.exists(checkpoint_path):
     # load the trained weights from a previous run instead of training again
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
-    print(f"loaded model from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint['model'])
+    print(f"loaded model from {checkpoint_path} (step {checkpoint['iter']}, val loss {checkpoint['val_loss']:.4f})")
 else:
     # create a PyTorch optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    start_time = time.time()
+    best_val_loss = float('inf')
 
     for iter in range(max_iters):
 
         # every once in a while evaluate the loss on train and val sets
         if iter % eval_interval == 0 or iter == max_iters - 1:
             losses = estimate_loss()
-            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            elapsed = int(time.time() - start_time)
+            # the text is small, so the model eventually memorizes it: train loss keeps falling while val loss
+            # turns back up. keep the weights from the step with the best val loss rather than the last step.
+            improved = losses['val'] < best_val_loss
+            if improved:
+                best_val_loss = losses['val'].item()
+                save_checkpoint(iter, best_val_loss)
+            print(f"[{time.strftime('%H:%M:%S')} +{elapsed // 60}m{elapsed % 60:02d}s] step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+                  f" ({bits_per_char(losses['val']):.3f} bits/char){' *saved' if improved else ''}")
 
         # sample a batch of data
         xb, yb = get_batch('train')
@@ -231,12 +260,13 @@ else:
         loss.backward()
         optimizer.step()
 
-    # save the trained weights so the next run can skip training
-    torch.save(model.state_dict(), checkpoint_path)
-    print(f"saved model to {checkpoint_path}")
+    # generate from the best weights, not the (possibly overfit) last ones
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint['model'])
+    print(f"saved best model to {checkpoint_path} (step {checkpoint['iter']}, val loss {checkpoint['val_loss']:.4f})")
 
 # generate from the model (eval mode turns off dropout)
 model.eval()
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
+context = torch.tensor([encode('\n')], dtype=torch.long, device=device) # start from a newline
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-#open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+#open('more.txt', 'w', encoding='utf-8').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
