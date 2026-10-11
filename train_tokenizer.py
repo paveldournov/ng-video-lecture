@@ -12,9 +12,9 @@ import argparse
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument('--input', default='warandpeace.txt', help='UTF-8 training text')
-parser.add_argument('--vocab-size', type=int, default=4096, help='number of tokens in the vocabulary')
-parser.add_argument('--output', default='tokenizer-rus.json', help='where to save the tokenizer')
+parser.add_argument('--input', default='data/tolstoy/tolstoy_all.txt', help='UTF-8 training text')
+parser.add_argument('--vocab-size', type=int, default=8192, help='number of tokens in the vocabulary')
+parser.add_argument('--output', default='tokenizer-tolstoy-all.json', help='where to save the tokenizer')
 args = parser.parse_args()
 
 with open(args.input, 'r', encoding='utf-8') as f:

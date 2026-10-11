@@ -1,17 +1,22 @@
+import html
 import os
 import time
 import torch
 import math
-import torch.nn as nn
-from torch.nn import functional as F
 from tokenizers import Tokenizer
+from model import GPT, GPTConfig, generate
 
 # hyperparameters
 batch_size = 64 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
-max_iters = 2000
-eval_interval = 100
-learning_rate = 3e-4
+max_iters = 10000
+eval_interval = 500
+learning_rate = 6e-4 # peak learning rate, reached after warmup_iters
+min_lr = 6e-5 # the learning rate decays to this by max_iters (cosine schedule)
+warmup_iters = 200
+weight_decay = 0.1
+betas = (0.9, 0.95)
+grad_clip = 1.0 # clip the gradient norm to this, so a bad batch can't throw the weights off
 if not torch.cuda.is_available():
     raise SystemExit(f"CUDA GPU not available (torch {torch.__version__}); install a CUDA build of PyTorch.")
 else:
@@ -19,13 +24,15 @@ else:
 
 device = 'cuda'
 eval_iters = 200
-n_embd = 384
-n_head = 6
-n_layer = 6
+n_embd = 512
+n_head = 8
+n_layer = 8
 dropout = 0.2
-input_path = 'warandpeace.txt' # UTF-8 training text; was 'input.txt' (tiny shakespeare)
-tokenizer_path = 'tokenizer-rus.json' # BPE tokenizer trained on input_path by train_tokenizer.py
-checkpoint_path = 'gpt-rus-bpe.model.pt' # best weights (lowest val loss) are saved here; delete the file to retrain
+input_path = 'data/tolstoy/tolstoy_all.txt' # UTF-8 training text, built by prepare_tolstoy.py
+tokenizer_path = 'tokenizer-tolstoy-all.json' # BPE tokenizer trained on input_path by train_tokenizer.py
+checkpoint_path = 'gpt-tolstoy-v2.model.pt' # best weights (lowest val loss) are saved here; delete the file to retrain
+wandb_project = 'tolstoy-gpt' # Weights & Biases project for live training charts; None turns logging off
+log_interval = 20 # send the training batch loss to W&B every this many steps
 # ------------
 
 torch.manual_seed(1337)
@@ -48,9 +55,11 @@ data = torch.tensor(encode(text), dtype=torch.long)
 chars_per_token = len(text) / len(data)
 bits_per_char = lambda loss: loss / chars_per_token / math.log(2)
 print(f"{len(text):,} characters -> {len(data):,} tokens, vocab size {vocab_size}")
-n = int(0.9*len(data)) # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
+# validation: every 10th block of 4096 tokens, so it samples all works and genres evenly
+# (the last 10% of the file would be mostly letters from the complete-works volumes)
+split_blocks = data.split(4096)
+train_data = torch.cat([b for i, b in enumerate(split_blocks) if i % 10 != 9])
+val_data = torch.cat([b for i, b in enumerate(split_blocks) if i % 10 == 9])
 
 # data loading
 def get_batch(split):
@@ -70,171 +79,58 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
 
-class Head(nn.Module):
-    """ one head of self-attention """
+config = GPTConfig(vocab_size=vocab_size, block_size=block_size, n_embd=n_embd, n_head=n_head, n_layer=n_layer, dropout=dropout)
+model = GPT(config).to(device) # the model itself lives in model.py, shared with infer.py
+# print the number of parameters in the model (the tied input/output embedding counts once)
+print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
 
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        # input of size (batch, time-step, channels)
-        # output of size (batch, time-step, head size)
-        B,T,C = x.shape
-        k = self.key(x)   # (B,T,hs)
-        q = self.query(x) # (B,T,hs)
-        # compute attention scores ("affinities")
-        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
-        wei = F.softmax(wei, dim=-1) # (B, T, T)
-        wei = self.dropout(wei)
-        # perform the weighted aggregation of the values
-        v = self.value(x) # (B,T,hs)
-        out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
-        return out
-
-class MultiHeadAttention(nn.Module):
-    """ multiple heads of self-attention in parallel """
-
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, n_embd)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
-
-class FeedFoward(nn.Module):
-    """ a simple linear layer followed by a non-linearity """
-
-    def __init__(self, n_embd):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-class Block(nn.Module):
-    """ Transformer block: communication followed by computation """
-
-    def __init__(self, n_embd, n_head):
-        # n_embd: embedding dimension, n_head: the number of heads we'd like
-        super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedFoward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
-        return x
-
-class GPTLanguageModel(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        # each token directly reads off the logits for the next token from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd) # final layer norm
-        self.lm_head = nn.Linear(n_embd, vocab_size)
-
-        # better init, not covered in the original GPT video, but important, will cover in followup video
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-
-        # idx and targets are both (B,T) tensor of integers
-        tok_emb = self.token_embedding_table(idx) # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
-        x = tok_emb + pos_emb # (B,T,C)
-        x = self.blocks(x) # (B,T,C)
-        x = self.ln_f(x) # (B,T,C)
-        logits = self.lm_head(x) # (B,T,vocab_size)
-
-        if targets is None:
-            loss = None
-        else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
-
-        return logits, loss
-
-    def generate(self, idx, max_new_tokens):
-        # idx is (B, T) array of indices in the current context
-        for _ in range(max_new_tokens):
-            # crop idx to the last block_size tokens
-            idx_cond = idx[:, -block_size:]
-            # get the predictions
-            logits, loss = self(idx_cond)
-            # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
-            # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) # (B, C)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-            # append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-        return idx
-
-model = GPTLanguageModel()
-m = model.to(device)
-# print the number of parameters in the model
-print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
+def get_lr(iter):
+    # linear warmup, then cosine decay from learning_rate down to min_lr at max_iters
+    if iter < warmup_iters:
+        return learning_rate * (iter + 1) / warmup_iters
+    progress = (iter - warmup_iters) / max(1, max_iters - warmup_iters)
+    return min_lr + 0.5 * (1 + math.cos(math.pi * progress)) * (learning_rate - min_lr)
 
 def save_checkpoint(iter, val_loss):
     # everything infer.py needs to rebuild the model without this script or the training text
     torch.save({
         'model': model.state_dict(),
-        'config': dict(vocab_size=vocab_size, block_size=block_size, n_embd=n_embd, n_head=n_head, n_layer=n_layer),
+        'config': dict(vars(config), arch='gpt2'), # model.from_checkpoint picks the model class by 'arch'
         'tokenizer': tokenizer_path,
         'iter': iter,
         'val_loss': val_loss,
     }, checkpoint_path)
 
+run = None # W&B run, only while training
 if os.path.exists(checkpoint_path):
     # load the trained weights from a previous run instead of training again
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint['model'])
     print(f"loaded model from {checkpoint_path} (step {checkpoint['iter']}, val loss {checkpoint['val_loss']:.4f})")
 else:
-    # create a PyTorch optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    # AdamW with weight decay on the weight matrices only; the learning rate is set every step from get_lr
+    optimizer = model.configure_optimizer(learning_rate, weight_decay, betas)
     start_time = time.time()
     best_val_loss = float('inf')
+
+    if wandb_project:
+        import wandb
+        run = wandb.init(project=wandb_project, name=checkpoint_path.removesuffix('.pt').removesuffix('.model'), config=dict(
+            batch_size=batch_size, block_size=block_size, max_iters=max_iters, eval_interval=eval_interval,
+            eval_iters=eval_iters, learning_rate=learning_rate, min_lr=min_lr, warmup_iters=warmup_iters,
+            weight_decay=weight_decay, betas=betas, grad_clip=grad_clip, n_embd=n_embd, n_head=n_head, n_layer=n_layer,
+            dropout=dropout, vocab_size=vocab_size, input_path=input_path, tokenizer_path=tokenizer_path,
+            train_tokens=len(train_data), val_tokens=len(val_data), chars_per_token=chars_per_token,
+            parameters=sum(p.numel() for p in model.parameters()),
+        ))
+    step_timer, timed_from = time.time(), 0 # wall time and first step of the current timing window
 
     for iter in range(max_iters):
 
@@ -250,15 +146,33 @@ else:
                 save_checkpoint(iter, best_val_loss)
             print(f"[{time.strftime('%H:%M:%S')} +{elapsed // 60}m{elapsed % 60:02d}s] step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
                   f" ({bits_per_char(losses['val']):.3f} bits/char){' *saved' if improved else ''}")
+            if run:
+                run.log({'eval/train_loss': losses['train'].item(), 'eval/val_loss': losses['val'].item(),
+                         'eval/val_bits_per_char': bits_per_char(losses['val'].item()), 'eval/best_val_loss': best_val_loss}, step=iter)
+            step_timer, timed_from = time.time(), iter # don't count the evaluation in the step time
+
+        lr = get_lr(iter)
+        for group in optimizer.param_groups:
+            group['lr'] = lr
 
         # sample a batch of data
         xb, yb = get_batch('train')
 
         # evaluate the loss
-        logits, loss = model(xb, yb)
+        # bfloat16 matrix math: ~1.6x faster on the RTX 3060 with the same loss; weights stay float32
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            logits, loss = model(xb, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+
+        if run and (iter + 1) % log_interval == 0:
+            run.log({'train/batch_loss': loss.item(), 'train/tokens_seen': (iter + 1) * batch_size * block_size,
+                     'train/lr': lr, 'train/grad_norm': grad_norm.item(),
+                     'perf/sec_per_step': (time.time() - step_timer) / (iter + 1 - timed_from),
+                     'perf/gpu_memory_gb': torch.cuda.max_memory_allocated() / 1e9}, step=iter)
+            step_timer, timed_from = time.time(), iter + 1
 
     # generate from the best weights, not the (possibly overfit) last ones
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -268,5 +182,13 @@ else:
 # generate from the model (eval mode turns off dropout)
 model.eval()
 context = torch.tensor([encode('\n')], dtype=torch.long, device=device) # start from a newline
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-#open('more.txt', 'w', encoding='utf-8').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+sample = decode(generate(model, context, max_new_tokens=500, temperature=0.8, top_p=0.95, repetition_penalty=1.1)[0].tolist())
+print(sample)
+if run:
+    import wandb
+    run.summary['best_step'] = checkpoint['iter']
+    run.summary['best_val_loss'] = checkpoint['val_loss']
+    run.summary['best_val_bits_per_char'] = bits_per_char(checkpoint['val_loss'])
+    run.log({'sample': wandb.Html(f"<pre>{html.escape(sample)}</pre>")})
+    run.finish()
+#open('more.txt', 'w', encoding='utf-8').write(decode(generate(model, context, max_new_tokens=10000)[0].tolist()))

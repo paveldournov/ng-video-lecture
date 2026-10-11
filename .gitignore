@@ -5,3 +5,7 @@
 .vscode/
 ~WRD*.tmp
 __pycache__/
+# downloaded pages and the texts built from them (~240 MB; re-created by prepare_tolstoy.py)
+data/
+# Weights & Biases local run files
+wandb/
